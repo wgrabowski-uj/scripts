@@ -1,0 +1,79 @@
+#this script finds all VMs in a specified resource group, finds associated public IPs, dissassociates them and deleted them as Azure resources
+  
+#!/bin/bash
+RG="myresourcegroup"  # Replace with your resource group
+
+az vm list --resource-group $RG --query "[].id" -o tsv | while read VM_ID; do
+    VM_NAME=$(basename $VM_ID)
+    echo "Processing VM: $VM_NAME"
+
+    az vm nic list --resource-group $RG --vm-name $VM_NAME --query "[].id" -o tsv | while read NIC_ID; do
+        NIC_NAME=$(basename $NIC_ID)
+        echo "|-- NIC: $NIC_NAME"
+        
+        az network nic ip-config list --nic-name $NIC_NAME --resource-group $RG --query "[].{Name:name, PublicIPId:publicIpAddress.id}" -o json | jq -c '.[]' | while read -r IP_CONFIG_JSON; do
+            IP_CONFIG=$(echo $IP_CONFIG_JSON | jq -r '.Name')
+            PUBLIC_IP_ID=$(echo $IP_CONFIG_JSON | jq -r '.PublicIPId')
+            
+            echo "  |-- IP Config: $IP_CONFIG"
+            
+            if [[ -n "$PUBLIC_IP_ID" && "$PUBLIC_IP_ID" != "null" ]]; then
+                PUBLIC_IP_NAME=$(basename $PUBLIC_IP_ID)
+                echo "    |-- Found public IP: $PUBLIC_IP_NAME"
+                
+                # Disassociate using explicit remove command
+                echo "    |-- Disassociating public IP..."
+                az network nic ip-config update \
+                    --nic-name $NIC_NAME \
+                    --resource-group $RG \
+                    --name $IP_CONFIG \
+                    --remove publicIpAddress
+                
+                # Add a small delay to ensure disassociation completes
+                echo "    |-- Waiting for disassociation to complete..."
+                sleep 10
+                
+                # Delete public IP (removed the --yes flag)
+                echo "    |-- Deleting public IP resource..."
+                az network public-ip delete \
+                    --ids $PUBLIC_IP_ID \
+                    --no-wait
+            else
+                # Try to find public IP by name pattern
+                POSSIBLE_PUBLIC_IP="${VM_NAME}PublicIP"
+                PUBLIC_IP_EXISTS=$(az network public-ip show --resource-group $RG --name $POSSIBLE_PUBLIC_IP --query "id" -o tsv 2>/dev/null)
+                
+                if [[ -n "$PUBLIC_IP_EXISTS" ]]; then
+                    echo "    |-- Found public IP by name: $POSSIBLE_PUBLIC_IP"
+                    
+                    # Check if this public IP is associated with the current IP config
+                    ASSOCIATED_CONFIG=$(az network public-ip show --ids $PUBLIC_IP_EXISTS --query "ipConfiguration.id" -o tsv)
+                    if [[ -n "$ASSOCIATED_CONFIG" ]]; then
+                        echo "    |-- Disassociating public IP..."
+                        # Get the NIC name and IP config name from the association
+                        ASSOCIATED_NIC=$(echo $ASSOCIATED_CONFIG | cut -d'/' -f9)
+                        ASSOCIATED_CONFIG_NAME=$(echo $ASSOCIATED_CONFIG | cut -d'/' -f11)
+                        
+                        az network nic ip-config update \
+                            --nic-name $ASSOCIATED_NIC \
+                            --resource-group $RG \
+                            --name $ASSOCIATED_CONFIG_NAME \
+                            --remove publicIpAddress
+                        
+                        # Add a small delay to ensure disassociation completes
+                        echo "    |-- Waiting for disassociation to complete..."
+                        sleep 10
+                    fi
+                    
+                    # Delete public IP (removed the --yes flag)
+                    echo "    |-- Deleting public IP resource..."
+                    az network public-ip delete \
+                        --ids $PUBLIC_IP_EXISTS \
+                        --no-wait
+                else
+                    echo "    |-- No public IP associated"
+                fi
+            fi
+        done
+    done
+done
